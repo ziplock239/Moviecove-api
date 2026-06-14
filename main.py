@@ -1,23 +1,27 @@
 """
-MovieBox API — FastAPI wrapper for MovieCove
-Deploy on Render (free tier). Exposes search, details,
-stream links and homepage content from the MovieBox backend.
+MovieCove — MovieBox API wrapper
+FastAPI server. Deploy on Render (free tier).
 """
 
-import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
-from moviebox_api.v3 import MovieBoxHttpClient
-from moviebox_api.v3.constants import SubjectType, TabID
-from moviebox_api.v3.core import Homepage, Search, SearchV2
+from moviebox_api.v3.http_client import MovieBoxHttpClient
+from moviebox_api.v3.constants import SubjectType, TabID, CustomResolutionType
+from moviebox_api.v3.core import (
+    Homepage,
+    Search,
+    ItemDetails,
+    SeasonDetails,
+    DownloadableVideoFilesDetail,
+    DownloadableCaptionFileDetails,
+)
 from moviebox_api.v3.exceptions import ZeroSearchResultsError
 
-# ── Shared HTTP client (one per worker process) ──────────────────────────────
+# ── Shared client (created once per process) ──────────────────────────────────
 _client: MovieBoxHttpClient | None = None
 
 
@@ -30,23 +34,21 @@ def get_client() -> MovieBoxHttpClient:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Warm up the client on startup
-    get_client()
-    yield
-    # Nothing to clean up — httpx closes connections on GC
+    get_client()          # warm up on startup
+    yield                 # app runs here
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="MovieCove — MovieBox API",
+    title="MovieCove API",
     version="1.0.0",
-    description="Proxy API wrapping the MovieBox backend for use with MovieCove.",
+    description="MovieBox proxy API for MovieCove.",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # lock this down to your MovieCove domain in production
+    allow_origins=["*"],   # restrict to your domain in production
     allow_methods=["GET"],
     allow_headers=["*"],
 )
@@ -54,7 +56,6 @@ app.add_middleware(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def cover_url(cover: Any) -> str | None:
-    """Safely extract a poster URL from a cover object."""
     if cover is None:
         return None
     if hasattr(cover, "url"):
@@ -64,8 +65,7 @@ def cover_url(cover: Any) -> str | None:
     return None
 
 
-def serialize_search_item(item: Any) -> dict:
-    """Convert a search result item to a plain dict for the response."""
+def fmt_search_item(item: Any) -> dict:
     return {
         "id": item.subject_id,
         "title": item.title,
@@ -75,7 +75,7 @@ def serialize_search_item(item: Any) -> dict:
         "duration": item.duration,
         "genre": item.genre if isinstance(item.genre, list) else [item.genre],
         "rating": item.imdb_rating_value,
-        "type": item.subject_type.name.lower(),   # "movie" | "tv_series"
+        "type": item.subject_type.name.lower(),
         "country": item.country_name,
         "language": item.language,
         "season_count": item.season_numbers,
@@ -83,9 +83,23 @@ def serialize_search_item(item: Any) -> dict:
     }
 
 
-def serialize_detail(detail: Any) -> dict:
-    """Convert an item-details model to a plain dict."""
-    d: dict[str, Any] = {
+def fmt_detail(detail: Any) -> dict:
+    # Flatten resource_detectors → list of stream objects
+    streams: list[dict] = []
+    for det in getattr(detail, "resource_detectors", []) or []:
+        for res in getattr(det, "resolution_list", []) or []:
+            streams.append({
+                "url": str(res.resource_link),
+                "resolution": res.resolution.value
+                    if hasattr(res.resolution, "value") else int(res.resolution),
+                "title": res.title,
+                "size": res.size,
+                "codec": res.codec_name,
+                "season": res.se,
+                "episode": res.ep,
+            })
+
+    return {
         "id": detail.subject_id,
         "title": detail.title,
         "description": detail.description,
@@ -99,45 +113,7 @@ def serialize_detail(detail: Any) -> dict:
         "language": detail.language,
         "season_count": detail.season_numbers,
         "category": detail.category,
-        "streams": [],
-        "subtitles": [],
-    }
-
-    # Flatten resource detectors → stream links per resolution
-    streams: list[dict] = []
-    for detector in getattr(detail, "resource_detectors", []) or []:
-        for res in getattr(detector, "resolution_list", []) or []:
-            streams.append({
-                "url": str(res.resource_link),
-                "resolution": res.resolution.value if hasattr(res.resolution, "value") else res.resolution,
-                "title": res.title,
-                "size": res.size,
-                "codec": res.codec_name,
-                "season": res.se,
-                "episode": res.ep,
-            })
-    d["streams"] = streams
-
-    # Subtitles
-    subtitles: list[dict] = []
-    for sub in getattr(detail, "subtitles", []) or []:
-        if isinstance(sub, str):
-            subtitles.append({"language": sub})
-        elif hasattr(sub, "language"):
-            subtitles.append({"language": sub.language, "url": str(getattr(sub, "url", ""))})
-    d["subtitles"] = subtitles
-
-    return d
-
-
-def serialize_homepage_item(item: Any) -> dict:
-    return {
-        "id": item.subject_id,
-        "title": item.title,
-        "poster": cover_url(item.cover),
-        "release_date": str(item.release_date) if item.release_date else None,
-        "genre": item.genre if isinstance(item.genre, list) else [item.genre],
-        "type": item.subject_type.name.lower(),
+        "streams": streams,
     }
 
 
@@ -155,23 +131,19 @@ async def health():
 
 @app.get("/search", tags=["Content"])
 async def search(
-    q: str = Query(..., min_length=1, max_length=120, description="Search query"),
-    type: str = Query("all", description="Content type: all | movie | tv_series"),
+    q: str = Query(..., min_length=1, max_length=120),
+    type: str = Query("all", description="all | movie | tv_series"),
     page: int = Query(1, ge=1, le=50),
     per_page: int = Query(20, ge=1, le=50),
 ):
-    """
-    Search for movies and TV series.
-
-    Returns a list of results with poster URLs, ratings, descriptions etc.
-    """
-    subject_type_map = {
+    """Search movies and TV series. Returns poster URLs, ratings, descriptions."""
+    type_map = {
         "movie": SubjectType.MOVIE,
         "tv_series": SubjectType.TV_SERIES,
         "tv": SubjectType.TV_SERIES,
         "all": SubjectType.ALL,
     }
-    subject_type = subject_type_map.get(type.lower(), SubjectType.ALL)
+    subject_type = type_map.get(type.lower(), SubjectType.ALL)
 
     try:
         searcher = Search(
@@ -182,64 +154,62 @@ async def search(
             per_page=per_page,
         )
         result = await searcher.get_content_model()
-        items = [serialize_search_item(i) for i in result.items]
         return {
             "query": q,
             "page": result.pager.page,
             "per_page": result.pager.per_page,
             "total": result.pager.total_count,
             "has_more": result.pager.has_more,
-            "results": items,
+            "results": [fmt_search_item(i) for i in result.items],
         }
     except ZeroSearchResultsError:
-        return {"query": q, "page": page, "per_page": per_page, "total": 0, "has_more": False, "results": []}
+        return {
+            "query": q, "page": page, "per_page": per_page,
+            "total": 0, "has_more": False, "results": [],
+        }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.get("/movie/{subject_id}", tags=["Content"])
 async def movie_details(subject_id: str):
-    """
-    Get full details for a movie or TV series by its MovieBox subject ID.
-
-    Includes poster, description, genre, rating, IMDB rating, and direct
-    stream URLs at multiple resolutions.
-    """
-    from moviebox_api.v3.core import ItemDetails
-
+    """Full details for a movie or TV series — poster, description, genre, rating."""
     try:
-        detail_fetcher = ItemDetails(
+        fetcher = ItemDetails(
             client_session=get_client(),
-            subject_id=subject_id,
+            include_seasons=True,
         )
-        detail = await detail_fetcher.get_content_model()
-        return serialize_detail(detail)
+        detail = await fetcher.get_content_model(subject_id)
+        return fmt_detail(detail)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.get("/streams/{subject_id}", tags=["Content"])
 async def stream_links(
     subject_id: str,
-    season: int = Query(0, ge=0),
-    episode: int = Query(0, ge=0),
+    quality: str = Query("best", description="best | 1080p | 720p | 480p | 360p"),
 ):
     """
-    Get direct MP4/stream URLs for a movie or a specific TV episode.
-
-    - For movies: season=0, episode=0
-    - For TV series: pass the correct season and episode numbers
+    Get direct MP4 stream URLs for a movie or TV series.
+    Returns all available resolutions.
     """
-    from moviebox_api.v3.core import DownloadableFiles
+    quality_map = {
+        "best": CustomResolutionType.BEST,
+        "1080p": CustomResolutionType._1080P,
+        "720p": CustomResolutionType._720P,
+        "480p": CustomResolutionType._480P,
+        "360p": CustomResolutionType._360P,
+        "worst": CustomResolutionType.WORST,
+    }
+    resolution = quality_map.get(quality.lower(), CustomResolutionType.BEST)
 
     try:
-        dl = DownloadableFiles(
+        dl = DownloadableVideoFilesDetail(
             client_session=get_client(),
-            subject_id=subject_id,
-            season=season,
-            episode=episode,
+            resolution=resolution,
         )
-        result = await dl.get_content_model()
+        result = await dl.get_content_model(subject_id)
 
         streams = []
         for item in result.list or []:
@@ -247,9 +217,10 @@ async def stream_links(
                 "url": str(item.resource_link),
                 "title": item.title,
                 "size": item.size,
-                "season": item.se,
-                "episode": item.ep,
-                "resolution": item.resolution.value if hasattr(item.resolution, "value") else 0,
+                "resolution": item.resolution,
+                "codec": item.codec_name,
+                "season": item.season,
+                "episode": item.episode,
             })
 
         return {
@@ -260,50 +231,44 @@ async def stream_links(
             "streams": streams,
         }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.get("/seasons/{subject_id}", tags=["Content"])
-async def season_info(subject_id: str):
-    """
-    Get season and episode count information for a TV series.
-    """
-    from moviebox_api.v3.core import Seasons
-
+async def seasons(subject_id: str):
+    """Season and episode count for a TV series."""
     try:
-        seasons_fetcher = Seasons(
-            client_session=get_client(),
-            subject_id=subject_id,
-        )
-        result = await seasons_fetcher.get_content_model()
-        seasons = []
-        for s in result.seasons or []:
-            seasons.append({
-                "season": s.season,
-                "episode_count": s.ep_count,
-                "title": s.title,
-            })
-        return {"subject_id": subject_id, "seasons": seasons}
+        fetcher = SeasonDetails(client_session=get_client())
+        result = await fetcher.get_content_model(subject_id)
+        return {
+            "subject_id": subject_id,
+            "total_seasons": result.total_seasons,
+            "seasons": [
+                {
+                    "season": s.se,
+                    "episode_count": s.max_ep,
+                }
+                for s in result.seasons or []
+            ],
+        }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.get("/home", tags=["Content"])
 async def homepage(
-    tab: str = Query("all", description="Tab: all | movie | tv_series | anime"),
+    tab: str = Query("all", description="all | movie | tv_series"),
     page: int = Query(1, ge=1, le=10),
 ):
     """
-    Get homepage/trending content — same as what MovieBox shows on launch.
-
-    Rotate the `page` parameter to get different sets on each load.
+    Trending / homepage content. Change page (1–10) to get different sets
+    on each refresh — perfect for the MovieCove home rows.
     """
-    tab_map = {
+    tab_map: dict[str, int | TabID] = {
         "all": 0,
         "movie": TabID.MOVIE,
         "tv_series": TabID.TV_SERIES,
         "tv": TabID.TV_SERIES,
-        "anime": TabID.ALL,
     }
     tab_id = tab_map.get(tab.lower(), 0)
 
@@ -315,45 +280,46 @@ async def homepage(
 
         items = []
         for topic in result.topics or []:
-            for item in getattr(topic, "subjects", []) or []:
-                items.append(serialize_homepage_item(item))
+            for subject in getattr(topic, "subjects", []) or []:
+                items.append({
+                    "id": subject.subject_id,
+                    "title": subject.title,
+                    "poster": cover_url(subject.cover),
+                    "release_date": str(subject.release_date)
+                        if subject.release_date else None,
+                    "genre": subject.genre
+                        if isinstance(subject.genre, list) else [subject.genre],
+                    "type": subject.subject_type.name.lower(),
+                })
 
-        return {
-            "tab": tab,
-            "page": page,
-            "items": items,
-        }
+        return {"tab": tab, "page": page, "items": items}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.get("/subtitles/{subject_id}", tags=["Content"])
 async def subtitles(
     subject_id: str,
-    season: int = Query(0, ge=0),
-    episode: int = Query(0, ge=0),
-    language: str = Query("English"),
+    resource_id: str = Query(..., description="resource_id from /streams response"),
 ):
     """
-    Get subtitle download URL for a movie or TV episode.
+    Get subtitle URLs for a video file.
+    Pass the resource_id from a /streams result.
     """
-    from moviebox_api.v3.core import Captions
-
     try:
-        caps = Captions(
-            client_session=get_client(),
-            subject_id=subject_id,
-            season=season,
-            episode=episode,
-        )
-        result = await caps.get_content_model()
-        subs = []
-        for cap in result.list or []:
-            subs.append({
-                "language": cap.language,
-                "url": str(cap.url) if cap.url else None,
-                "format": cap.format,
-            })
-        return {"subject_id": subject_id, "subtitles": subs}
+        caps = DownloadableCaptionFileDetails(client_session=get_client())
+        result = await caps.get_content_model(subject_id, resource_id)
+        return {
+            "subject_id": subject_id,
+            "subtitles": [
+                {
+                    "language": cap.lan_name,
+                    "code": cap.lan,
+                    "url": str(cap.url),
+                    "size": cap.size,
+                }
+                for cap in result.external_captions or []
+            ],
+        }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+        raise HTTPException(status_code=502, detail=str(e))
