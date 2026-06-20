@@ -29,6 +29,43 @@ from movie_box.v3.core import (
 )
 from movie_box.v3.exceptions import ZeroSearchResultsError
 
+
+# ── Compatibility patch ────────────────────────────────────────────────────────
+# movie-box-dl's Pydantic models use extra="forbid", which means ANY new field
+# the live MovieBox API adds (e.g. "showLine" inside customData, added without
+# warning) crashes parsing entirely with a validation error instead of being
+# safely ignored. We relax every v3 model from "forbid" to "ignore" at import
+# time so new/unknown upstream fields are dropped instead of breaking responses.
+# This does not loosen validation of fields we actually rely on — required
+# fields are still required; this only stops rejecting *extra* fields.
+def _patch_models_to_ignore_extra_fields() -> int:
+    import inspect
+
+    from pydantic import BaseModel, ConfigDict
+
+    import movie_box.v3.models.common as _common
+    import movie_box.v3.models.homepage as _homepage
+    import movie_box.v3.models.search as _search
+    import movie_box.v3.models.details as _details
+    import movie_box.v3.models.downloadables as _downloadables
+
+    patched = 0
+    for mod in (_common, _homepage, _search, _details, _downloadables):
+        for _name, obj in vars(mod).items():
+            if (
+                inspect.isclass(obj)
+                and issubclass(obj, BaseModel)
+                and obj is not BaseModel
+                and obj.model_config.get("extra") == "forbid"
+            ):
+                obj.model_config = ConfigDict(**{**obj.model_config, "extra": "ignore"})
+                obj.model_rebuild(force=True)
+                patched += 1
+    return patched
+
+
+_PATCHED_MODEL_COUNT = _patch_models_to_ignore_extra_fields()
+
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="MovieCove API",
@@ -110,7 +147,13 @@ def fmt_detail(detail: Any) -> dict:
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {"status": "ok", "message": "MovieCove API is running", "engine": "movie-box-dl"}
+    return {
+        "status": "ok",
+        "message": "MovieCove API is running",
+        "engine": "movie-box-dl",
+        "compat_patch_applied": True,
+        "models_patched": _PATCHED_MODEL_COUNT,
+    }
 
 
 @app.get("/health", tags=["Health"])
