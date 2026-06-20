@@ -1,5 +1,6 @@
 """
 MovieCove — MovieBox API wrapper
+Powered by movie-box-dl (https://github.com/parthmax2/movie-box)
 FastAPI server. Deploy on Render (free tier).
 """
 
@@ -9,9 +10,9 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from moviebox_api.v3.http_client import MovieBoxHttpClient
-from moviebox_api.v3.constants import SubjectType, TabID, CustomResolutionType
-from moviebox_api.v3.core import (
+from movie_box.v3.http_client import MovieBoxHttpClient
+from movie_box.v3.constants import SubjectType, TabID, CustomResolutionType
+from movie_box.v3.core import (
     Homepage,
     Search,
     ItemDetails,
@@ -19,7 +20,7 @@ from moviebox_api.v3.core import (
     DownloadableVideoFilesDetail,
     DownloadableCaptionFileDetails,
 )
-from moviebox_api.v3.exceptions import ZeroSearchResultsError
+from movie_box.v3.exceptions import ZeroSearchResultsError
 
 # ── Shared client (created once per process) ──────────────────────────────────
 _client: MovieBoxHttpClient | None = None
@@ -41,8 +42,8 @@ async def lifespan(app: FastAPI):
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="MovieCove API",
-    version="1.0.0",
-    description="MovieBox proxy API for MovieCove.",
+    version="2.0.0",
+    description="MovieBox proxy API for MovieCove, powered by movie-box-dl.",
     lifespan=lifespan,
 )
 
@@ -121,7 +122,7 @@ def fmt_detail(detail: Any) -> dict:
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {"status": "ok", "message": "MovieCove API is running"}
+    return {"status": "ok", "message": "MovieCove API is running", "engine": "movie-box-dl"}
 
 
 @app.get("/health", tags=["Health"])
