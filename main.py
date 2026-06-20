@@ -2,9 +2,16 @@
 MovieCove — MovieBox API wrapper
 Powered by movie-box-dl (https://github.com/parthmax2/movie-box)
 FastAPI server. Deploy on Render (free tier).
+
+IMPORTANT: MovieBoxHttpClient must be opened with `async with` for every
+request — it has no usable state until __aenter__ runs (that's where the
+underlying httpx.AsyncClient is actually created). A single shared
+long-lived client is not used here; instead each request opens and closes
+its own client. This avoids "Client not started" errors and avoids
+sharing one httpx connection pool across concurrent requests in a way that
+could break under load.
 """
 
-from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -22,29 +29,11 @@ from movie_box.v3.core import (
 )
 from movie_box.v3.exceptions import ZeroSearchResultsError
 
-# ── Shared client (created once per process) ──────────────────────────────────
-_client: MovieBoxHttpClient | None = None
-
-
-def get_client() -> MovieBoxHttpClient:
-    global _client
-    if _client is None:
-        _client = MovieBoxHttpClient()
-    return _client
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    get_client()          # warm up on startup
-    yield                 # app runs here
-
-
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="MovieCove API",
-    version="2.0.0",
+    version="2.0.1",
     description="MovieBox proxy API for MovieCove, powered by movie-box-dl.",
-    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -85,7 +74,6 @@ def fmt_search_item(item: Any) -> dict:
 
 
 def fmt_detail(detail: Any) -> dict:
-    # Flatten resource_detectors → list of stream objects
     streams: list[dict] = []
     for det in getattr(detail, "resource_detectors", []) or []:
         for res in getattr(det, "resolution_list", []) or []:
@@ -139,22 +127,26 @@ async def search(
 ):
     """Search movies and TV series. Returns poster URLs, ratings, descriptions."""
     type_map = {
-        "movie": SubjectType.MOVIE,
+        "movie": SubjectType.MOVIES,
+        "movies": SubjectType.MOVIES,
         "tv_series": SubjectType.TV_SERIES,
         "tv": SubjectType.TV_SERIES,
+        "anime": SubjectType.ANIME,
+        "music": SubjectType.MUSIC,
         "all": SubjectType.ALL,
     }
     subject_type = type_map.get(type.lower(), SubjectType.ALL)
 
     try:
-        searcher = Search(
-            client_session=get_client(),
-            query=q,
-            subject_type=subject_type,
-            page=page,
-            per_page=per_page,
-        )
-        result = await searcher.get_content_model()
+        async with MovieBoxHttpClient() as client:
+            searcher = Search(
+                client_session=client,
+                query=q,
+                subject_type=subject_type,
+                page=page,
+                per_page=per_page,
+            )
+            result = await searcher.get_content_model()
         return {
             "query": q,
             "page": result.pager.page,
@@ -176,11 +168,12 @@ async def search(
 async def movie_details(subject_id: str):
     """Full details for a movie or TV series — poster, description, genre, rating."""
     try:
-        fetcher = ItemDetails(
-            client_session=get_client(),
-            include_seasons=True,
-        )
-        detail = await fetcher.get_content_model(subject_id)
+        async with MovieBoxHttpClient() as client:
+            fetcher = ItemDetails(
+                client_session=client,
+                include_seasons=True,
+            )
+            detail = await fetcher.get_content_model(subject_id)
         return fmt_detail(detail)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -206,11 +199,12 @@ async def stream_links(
     resolution = quality_map.get(quality.lower(), CustomResolutionType.BEST)
 
     try:
-        dl = DownloadableVideoFilesDetail(
-            client_session=get_client(),
-            resolution=resolution,
-        )
-        result = await dl.get_content_model(subject_id)
+        async with MovieBoxHttpClient() as client:
+            dl = DownloadableVideoFilesDetail(
+                client_session=client,
+                resolution=resolution,
+            )
+            result = await dl.get_content_model(subject_id)
 
         streams = []
         for item in result.list or []:
@@ -239,8 +233,9 @@ async def stream_links(
 async def seasons(subject_id: str):
     """Season and episode count for a TV series."""
     try:
-        fetcher = SeasonDetails(client_session=get_client())
-        result = await fetcher.get_content_model(subject_id)
+        async with MovieBoxHttpClient() as client:
+            fetcher = SeasonDetails(client_session=client)
+            result = await fetcher.get_content_model(subject_id)
         return {
             "subject_id": subject_id,
             "total_seasons": result.total_seasons,
@@ -274,10 +269,11 @@ async def homepage(
     tab_id = tab_map.get(tab.lower(), 0)
 
     try:
-        home = Homepage(client_session=get_client())
-        home._page_number = page
-        home._tab_id = tab_id
-        result = await home.get_content_model()
+        async with MovieBoxHttpClient() as client:
+            home = Homepage(client_session=client)
+            home._page_number = page
+            home._tab_id = tab_id
+            result = await home.get_content_model()
 
         items = []
         for topic in result.topics or []:
@@ -308,8 +304,9 @@ async def subtitles(
     Pass the resource_id from a /streams result.
     """
     try:
-        caps = DownloadableCaptionFileDetails(client_session=get_client())
-        result = await caps.get_content_model(subject_id, resource_id)
+        async with MovieBoxHttpClient() as client:
+            caps = DownloadableCaptionFileDetails(client_session=client)
+            result = await caps.get_content_model(subject_id, resource_id)
         return {
             "subject_id": subject_id,
             "subtitles": [
